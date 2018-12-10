@@ -5,26 +5,18 @@ from collections import Counter
 
 from lmfdb.utils import make_logger, encode_plot
 
-from lmfdb.base import app, getDBConnection
+from lmfdb.db_backend import db
+from lmfdb.base import app
 
-from sage.misc.cachefunc import cached_function
 from sage.rings.all import Integer, QQ, RR
 from sage.plot.all import line, points, circle, Graphics
 
-from lmfdb.genus2_curves.web_g2c import list_to_factored_poly_otherorder
+from lmfdb.utils import list_to_factored_poly_otherorder
 from lmfdb.WebNumberField import nf_display_knowl, field_pretty
 from lmfdb.transitive_group import group_display_knowl
 from lmfdb.abvar.fq.web_abvar import av_display_knowl, av_data#, av_knowl_guts
 
 logger = make_logger("abvarfq")
-
-#########################
-#   Database connection
-#########################
-
-@cached_function
-def db():
-    return getDBConnection().abvar.fq_isog
 
 #########################
 #   Label manipulation
@@ -64,7 +56,7 @@ class AbvarFq_isoclass(object):
         Searches for a specific isogeny class in the database by label.
         """
         try:
-            data = db().find_one({"label": label})
+            data = db.av_fqisog.lookup(label)
             return cls(data)
         except (AttributeError, TypeError):
             raise ValueError("Label not found in database")
@@ -74,20 +66,39 @@ class AbvarFq_isoclass(object):
         self.basechangeinfo = self.basechange_display()
         self.formatted_polynomial = list_to_factored_poly_otherorder(self.polynomial,galois=False,vari = 'x')
 
+    @property
     def p(self):
         q = Integer(self.q)
         p, _ = q.is_prime_power(get_data=True)
         return p
 
+    @property
     def r(self):
         q = Integer(self.q)
         _, r = q.is_prime_power(get_data=True)
         return r
 
+    @property
+    def slopes(self):
+        # Remove the multiset indicators
+        return [s[:-1] for s in self.slps]
+
+    @property
+    def C_counts(self):
+        return [str(ct) for ct in self.C_cnts]
+
+    @property
+    def A_counts(self):
+        return [str(ct) for ct in self.A_cnts]
+
+    @property
+    def polynomial(self):
+        return self.poly
+
     def field(self, q=None):
         if q is None:
-            p = self.p()
-            r = self.r()
+            p = self.p
+            r = self.r
         else:
             p, r = Integer(q).is_prime_power(get_data=True)
         if r == 1:
@@ -96,7 +107,7 @@ class AbvarFq_isoclass(object):
             return '\F_{' + '{0}^{1}'.format(p,r) + '}'
 
     def newton_plot(self):
-        S = [QQ(str(s)) for s in self.slopes]
+        S = [QQ(s) for s in self.slopes]
         C = Counter(S)
         pts = [(0,0)]
         x = y = 0
@@ -126,7 +137,7 @@ class AbvarFq_isoclass(object):
     def circle_plot(self):
         pts = []
         pi = RR.pi()
-        for angle in self.angle_numbers:
+        for angle in self.angles:
             angle = RR(angle)*pi
             c = angle.cos()
             s = angle.sin()
@@ -141,13 +152,13 @@ class AbvarFq_isoclass(object):
 
     def _make_jacpol_property(self):
         ans = []
-        if self.principally_polarizable == 1:
+        if self.is_pp == 1:
             ans.append((None, 'Principally polarizable'))
-        elif self.principally_polarizable == -1:
+        elif self.is_pp == -1:
             ans.append((None, 'Not principally polarizable'))
-        if self.known_jacobian == 1:
+        if self.is_jac == 1:
             ans.append((None, 'Contains a Jacobian'))
-        elif self.known_jacobian == -1:
+        elif self.is_jac == -1:
             ans.append((None, 'Does not contain a Jacobian'))
         return ans
 
@@ -164,7 +175,7 @@ class AbvarFq_isoclass(object):
     #def weil_numbers(self):
     #    q = self.q
     #    ans = ""
-    #    for angle in self.angle_numbers:
+    #    for angle in self.angles:
     #        if ans != "":
     #            ans += ", "
     #        ans += '\sqrt{' +str(q) + '}' + '\exp(\pm i \pi {0}\ldots)'.format(angle)
@@ -174,7 +185,7 @@ class AbvarFq_isoclass(object):
     def frob_angles(self):
         ans = ''
         eps = 0.00000001
-        for angle in self.angle_numbers:
+        for angle in self.angles:
             if ans != '':
                 ans += ', '
             if abs(angle) > eps and abs(angle - 1) > eps:
@@ -185,10 +196,10 @@ class AbvarFq_isoclass(object):
         return ans
 
     def is_simple(self):
-        return len(self.decomposition) == 1 and self.decomposition[0][1] == 1
+        return self.is_simp
 
     def is_primitive(self):
-        return len(self.primitive_models) == 0
+        return self.is_prim
 
     def is_ordinary(self):
         return self.p_rank == self.g
@@ -206,18 +217,16 @@ class AbvarFq_isoclass(object):
         return len(self.C_counts)
 
     def display_number_field(self):
-        if self.number_field == "":
+        if self.nf == "":
             return "The number field of this isogeny class is not in the database."
         else:
-            C = getDBConnection()
-            return nf_display_knowl(self.number_field,C,field_pretty(self.number_field))
+            return nf_display_knowl(self.nf,field_pretty(self.nf))
 
     def display_galois_group(self):
-        if self.galois_t == "": #the number field was not found in the database
+        if not hasattr(self, 'galois_t') or not self.galois_t: #the number field was not found in the database
             return "The Galois group of this isogeny class is not in the database."
         else:
-            C = getDBConnection()
-            return group_display_knowl(self.galois_n,self.galois_t,C)
+            return group_display_knowl(self.galois_n, self.galois_t)
 
     def decomposition_display_search(self,factors):
         if len(factors) == 1 and factors[0][1] == 1:
@@ -235,7 +244,7 @@ class AbvarFq_isoclass(object):
         return ans
 
     def decomposition_display(self):
-        factors = self.decomposition
+        factors = self.decomp
         if len(factors) == 1 and factors[0][1] == 1:
             return 'simple'
         ans = ''
@@ -249,7 +258,7 @@ class AbvarFq_isoclass(object):
         return ans
 
     def basechange_display(self):
-        models = self.primitive_models
+        models = self.prim_models
         if len(models) == 0:
             return 'primitive'
         ans = '<table class = "ntdata">\n'

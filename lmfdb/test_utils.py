@@ -1,4 +1,4 @@
-# -*- coding: utf8 -*-
+# -*- coding: utf-8 -*-
 # LMFDB - L-function and Modular Forms Database web-site - www.lmfdb.org
 # Copyright (C) 2017 by the LMFDB authors
 #
@@ -19,8 +19,8 @@ from lmfdb.utils import (
     round_to_half_int,
     splitcoeff,
     to_dict,
-    truncate_number,
     comma,
+    format_percentage,
     signtocolour,
     rgbtohex,
     pol_to_html,
@@ -91,15 +91,6 @@ class UtilsTest(unittest2.TestCase):
         self.assertEqual(to_dict({"not_list": 1, "is_list":[2,3,4]}),
                          {'is_list': 4, 'not_list': 1})
 
-    def test_truncate_number(self):
-        r"""
-        Checking utility: truncate_number
-        """
-        self.assertEqual(truncate_number(1.000001, 5), "1")
-        self.assertEqual(truncate_number(1.123456, 5), "1.123")
-        self.assertEqual(truncate_number(-1.123456, 5), "-1.123")
-        self.assertEqual(truncate_number(0.000002, 5), "0")
-
     def test_splitcoeff(self):
         r"""
         Checking utility: splitcoeff
@@ -118,6 +109,13 @@ class UtilsTest(unittest2.TestCase):
         """
         self.assertEqual(comma(123), "123")
         self.assertEqual(comma(123456789), "123,456,789")
+
+    def test_format_percentage(self):
+        r"""
+        Checking utility: format_percentage
+        """
+        self.assertEqual(format_percentage(12,31), '     38.71')
+        self.assertEqual(format_percentage(12,37), '     32.43')
 
     def test_signtocolour(self):
         r"""
@@ -157,6 +155,8 @@ class UtilsTest(unittest2.TestCase):
         self.assertEqual(web_latex("test string"), "test string")
         self.assertEqual(web_latex(x**23 + 2*x + 1),
                          '\\( x^{23} + 2 \\, x + 1 \\)')
+        self.assertEqual(web_latex(x**23 + 2*x + 1, enclose=False),
+                         ' x^{23} + 2 \\, x + 1 ')
 
     def test_web_latex_ideal_fact(self):
         r"""
@@ -169,6 +169,8 @@ class UtilsTest(unittest2.TestCase):
         I = K.ideal(2/(5+a)).factor()
         self.assertEqual(web_latex_ideal_fact(I),
                          '\\( \\left(-a\\right)^{-1} \\)')
+        self.assertEqual(web_latex_ideal_fact(I, enclose=False),
+                         ' \\left(-a\\right)^{-1} ')
 
     def test_web_latex_split_on(self):
         r"""

@@ -4,8 +4,8 @@ from lmfdb.base import LmfdbTest
 class HomePageTest(LmfdbTest):
 
     def check(self,homepage,path,text):
-        assert path in homepage
-        assert text in self.tc.get(path).data
+        assert path in homepage, "%s not in the homepage" % path
+        assert text in self.tc.get(path).data, "%s not in the %s" % (text, path)
 
     def check_external(self, homepage, path, text):
         import urllib2
@@ -34,8 +34,9 @@ class HomePageTest(LmfdbTest):
         """
         homepage = self.tc.get("/").data
         self.check(homepage,"/L/Riemann/",  'Pole at \(s=1\)')
-        self.check(homepage,"/ModularForm/GL2/Q/holomorphic/1/12/1/a/", '0.2993668')
-        self.check(homepage,"/L/ModularForm/GL2/Q/holomorphic/1/12/1/a/0/", 'approx 0.839345512')
+        self.check(homepage,"/ModularForm/GL2/Q/holomorphic/1/12/a/a/", '4830')
+        self.check(homepage,"/ModularForm/GL2/Q/holomorphic/1/12/a/a/", '113643')
+        self.check(homepage,"/L/ModularForm/GL2/Q/holomorphic/1/12/a/a/", '0.792122')
         self.check(homepage,"/EllipticCurve/Q/5077/a/1", r'y^2 + y = x^{3} - 7 x + 6')
         self.check(homepage,"/L/EllipticCurve/Q/5077.a/", '5077')
 
@@ -45,7 +46,7 @@ class HomePageTest(LmfdbTest):
         Check that the links in Box 3 work.
         """
         homepage = self.tc.get("/").data
-        self.check(homepage, "/L/", 'Holomorphic cusp form')
+        self.check(homepage, "/L/", 'Holomorphic Cusp Form')
         self.check(homepage, "/ModularForm/", r'Maass Forms on \(\GL(2,\Q) \)')
         self.check(homepage, "/EllipticCurve/Q/", 'curve, label or isogeny class label')
         self.check(homepage, "/NumberField/", 'x^7 - x^6 - 3 x^5 + x^4 + 4 x^3 - x^2 - x + 1')

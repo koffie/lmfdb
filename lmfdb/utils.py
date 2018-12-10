@@ -13,21 +13,126 @@ import time
 import math
 import cmath
 import sage
+from types import GeneratorType
+from urllib import urlencode
 
-from sage.all import latex, CC
+from sage.all import latex, CC, factor, PolynomialRing, ZZ, NumberField, RealField, CBF, CDF, RIF
+from sage.structure.element import Element
 from copy import copy
-from random import randint
 from functools import wraps
+from itertools import islice
 from flask import request, make_response, flash, url_for, current_app
 from werkzeug.contrib.cache import SimpleCache
 from werkzeug import cached_property
 from markupsafe import Markup
-
 from lmfdb.base import app
+
+
+
+
+def list_to_factored_poly_otherorder(s, galois=False, vari = 'T', prec = None, p = None):
+    """ Either return the polynomial in a nice factored form,
+        or return a pair, with first entry the factored polynomial
+        and the second entry a list describing the Galois groups
+        of the factors.
+        vari allows to choose the variable of the polynomial to be returned.
+    """
+    gal_list=[]
+    if len(s) == 1:
+        if galois:
+            return [str(s[0]), [[0,0]]]
+        return str(s[0])
+    sfacts = factor(PolynomialRing(ZZ, 'T')(s))
+    sfacts_fc = [[v[0],v[1]] for v in sfacts]
+    if sfacts.unit() == -1:
+        sfacts_fc[0][0] *= -1
+    outstr = ''
+    for v in sfacts_fc:
+        this_poly = v[0]
+        # if the factor is -1+T^2, replace it by 1-T^2
+        # this should happen an even number of times, mod powers
+        if this_poly.substitute(T=0) == -1:
+            this_poly = -1*this_poly
+            v[0] = this_poly
+        if galois:
+            this_degree = this_poly.degree()
+            # hack because currently sage only handles monic polynomials:
+            this_poly = this_poly.reverse()
+            this_number_field = NumberField(this_poly, "a")
+            this_gal = this_number_field.galois_group(type='pari')
+            this_t_number = this_gal.group().__pari__()[2].sage()
+            gal_list.append([this_degree, this_t_number])
+        vcf = v[0].list()
+        terms = 0
+        if len(sfacts) > 1 or v[1] > 1:
+            outstr += '('
+        for i in range(len(vcf)):
+            if vcf[i] != 0:
+                if terms > 0 and vcf[i] > 0:
+                    outstr += '+'
+                if i == 0:
+                    outstr += str(vcf[i])
+                else:
+                    if i == 1:
+                        variableterm = vari
+                    elif i > 1:
+                        variableterm = vari + '^{' + str(i) + '}'
+
+                    if terms == prec and i != len(vcf) - 1:
+                        if vcf[i] < 0:
+                            outstr += '+' # we haven't added the +
+                        outstr += 'O(%s)' % variableterm
+                        break;
+                    if vcf[i] == 1:
+                        outstr += variableterm
+                    elif abs(vcf[i]) != 1:
+                        if p is None or vcf[i] % p != 0:
+                            outstr += str(vcf[i]) + variableterm
+                        else:
+                            # we try to factor p
+                            res = vcf[i]
+                            e = 0
+                            while res % p == 0:
+                                res /= p
+                                e += 1
+                            assert e != 0
+                            pfactor = 'p^{%d}' % e if e > 1 else 'p'
+                            if res == 1:
+                                res = ''
+                            elif res == -1:
+                                res = '-'
+                            else:
+                                res = str(res)
+                            outstr += '%s %s %s' % (res, pfactor, variableterm)
+                    elif vcf[i] == -1:
+                        outstr += '-' + variableterm
+                terms += 1
+
+        if len(sfacts) > 1 or v[1] > 1:
+            outstr += ')'
+        if v[1] > 1:
+            outstr += '^{' + str(v[1]) + '}'
+    if galois:
+        if galois and len(sfacts_fc)==2:
+            if sfacts[0][0].degree()==2 and sfacts[1][0].degree()==2:
+                troubletest = sfacts[0][0].disc()*sfacts[1][0].disc()
+                if troubletest.is_square():
+                    gal_list=[[2,1]]
+        return [outstr, gal_list]
+    return outstr
 
 ################################################################################
 #   number utilities
 ################################################################################
+
+def try_int(foo):
+    try:
+        return int(foo)
+    except Exception:
+        return foo
+
+def key_for_numerically_sort(elt):
+    return map(try_int, elt.split("."))
 
 def an_list(euler_factor_polynomial_fn,
             upperbound=100000, base_field=sage.rings.all.RationalField()):
@@ -71,10 +176,9 @@ def an_list(euler_factor_polynomial_fn,
             k += 1
     return result
 
-
-def coeff_to_poly(c):
+def coeff_to_poly(c, var='x'):
     """
-    Convert a string representation of a polynomial to a sage polynomial.
+    Convert a list or string representation of a polynomial to a sage polynomial.
 
     Examples:
     >>> coeff_to_poly("1 - 3x + x^2")
@@ -83,8 +187,14 @@ def coeff_to_poly(c):
     x**2 - 3*x + 1
     """
     from sage.all import PolynomialRing, QQ
-    return PolynomialRing(QQ, 'x')(c)
+    return PolynomialRing(QQ, var)(c)
 
+def coeff_to_power_series(c, var='q', prec=None):
+    """
+    Convert a list or dictionary giving coefficients to a sage power series.
+    """
+    from sage.all import PowerSeriesRing, QQ
+    return PowerSeriesRing(QQ, var)(c, prec)
 
 def display_multiset(mset, formatter=str, *args):
     """
@@ -124,22 +234,64 @@ def pair2complex(pair):
         ip = 0
     return [float(rp), float(ip)]
 
+def round_RBF_to_half_int(x):
+    x = RIF(x)
+    try:
+        k = x.unique_round()
+        if (x - k).contains_zero():
+            return int(k)
+    except ValueError:
+        pass
+    try:
+        k = (2*x).unique_round()
+        if (2*x - k).contains_zero():
+            return float(k)/2
+    except ValueError:
+        pass
+    try:
+        return float(x)
+    except TypeError: # old version of Sage
+        return float(x.n(x.prec()))
 
-def round_to_half_int(num, fraction=2):
-    """
-    Rounds input `num` to the nearest half-integer. The optional kwarg
-    `fraction` is used to round to the nearest `fraction`-part of an integer.
+def round_CBF_to_half_int(x):
+    return CDF(tuple(map(round_RBF_to_half_int, [x.real(), x.imag()])))
 
-    Examples:
-    >>> round_to_half_int(1.1)
-    1.0
-    >>> round_to_half_int(-0.9)
-    -1.0
-    """
-    return round(num * 1.0 * fraction) / fraction
+def str_to_CBF(s):
+    # in sage 8.2 or earlier this is equivalent to CBF(s)
+    s = str(s) # to convert from unicode
+    try:
+        return CBF(s)
+    except TypeError:
+        sign = 1
+        s = s.lstrip('+')
+        if '+' in s:
+            a, b = s.rsplit('+', 1)
+        elif '-' in s:
+            a, b = s.rsplit('-',1)
+            sign = -1
+        else:
+            a = ''
+            b = s
+        a = a.lstrip(' ')
+        b = b.lstrip(' ')
+        if 'I' in a:
+            b, a = a, b
+        assert 'I' in b or b == ''
+        if b == 'I':
+            b = '1'
+        else:
+            b = b.rstrip(' ').rstrip('I').rstrip('*')
+        
+        res = CBF(0)
+        if a:
+            res += CBF(a)
+        if b:
+            res  +=  sign * CBF(b)* CBF.gens()[0]
+        return res
 
 
-def to_dict(args):
+
+def to_dict(args, exclude = []):
     r"""
     Input a dictionary `args` whose values may be lists.
     Output a dictionary whose values are not lists, by choosing the last
@@ -152,36 +304,116 @@ def to_dict(args):
     d = {}
     for key in args:
         values = args[key]
-        if isinstance(values, list):
+        if isinstance(values, list) and key not in exclude:
             if values:
                 d[key] = values[-1]
         elif values:
             d[key] = values
     return d
 
+def is_exact(x):
+    return (type(x) in [int, long]) or (isinstance(x, Element) and x.parent().is_exact())
 
-def truncate_number(num, precision):
+def display_float(x, digits, method = "truncate", extra_truncation_digits = 3):
+    if is_exact(x):
+        return '%s' % x
+    if abs(x) < 10.**(- digits - extra_truncation_digits):
+        return "0"
+    k = round_to_half_int(x)
+    if k == x:
+        k2 = None
+        try:
+            k2 = ZZ(2*x)
+        except TypeError:
+            pass;
+        # the second statment checks for overflow
+        if k2 == 2*x and (2*x + 1) - k2 == 1:
+            if k2 % 2 == 0:
+                s = '%s' % (k2/2)
+            else:
+                s = '%s' % (float(k2)/2)
+            return s
+    if method == 'truncate':
+        rnd = 'RNDZ'
+    else:
+        rnd = 'RNDN'
+    no_sci = 'e' not in "%.{}g".format(digits) % float(x)
+    try:
+        s = RealField(max(53,4*digits),  rnd=rnd)(x).str(digits=digits, no_sci=no_sci)
+    except TypeError:
+        # older versions of Sage don't support the digits keyword
+        s = RealField(max(53,4*digits),  rnd=rnd)(x).str(no_sci=no_sci)
+        point = s.find('.')
+        if point != -1:
+            if point < digits:
+                s = s[:digits+1]
+            else:
+                s = s[:point]
+    return s
+
+def display_complex(x, y, digits, method = "truncate", parenthesis = False, extra_truncation_digits = 3):
     """
-    Truncate `num` to show `precision` characters (as a string). If `num` is
-    nearly an integer or half-integer, return that integer or
-    half-integer instead.
+    Examples:
+    >>> display_complex(1.0001, 0, 3, parenthesis = True)
+    '1.000'
+    >>> display_complex(1.0, -1, 3, parenthesis = True)
+    '(1 - i)'
+    >>> display_complex(0, -1, 3, parenthesis = True)
+    '-i'
+    >>> display_complex(0, 1, 3, parenthesis = True)
+    'i'
+    >>> display_complex(0.49999, -1.001, 3, parenthesis = True)
+    '(0.500 - 1.000i)'
+    >>> display_complex(0.02586558415542463,0.9996654298095432, 3)
+    '0.025 + 0.999i
+    >>> display_complex(0.00049999, -1.12345, 3, parenthesis = False, extra_truncation_digits = 3)
+    '0.000 - 1.123i'
+    >>> display_complex(0.00049999, -1.12345, 3, parenthesis = False, extra_truncation_digits = 2)
+    '0.000 - 1.123i'
+    >>> display_complex(0.00049999, -1.12345, 3, parenthesis = False, extra_truncation_digits = 1)
+    '-1.123i'
+    """
+    if abs(y) < 10.**(- digits - extra_truncation_digits):
+        return display_float(x, digits, method = method, extra_truncation_digits = extra_truncation_digits)
+    if abs(x) < 10.**(- digits - extra_truncation_digits):
+        x = ""
+    else:
+        x = display_float(x, digits, method = method, extra_truncation_digits = extra_truncation_digits)
+    if y < 0:
+        y = -y
+        if x == "":
+            sign = "-"
+        else:
+            sign = " - "
+    else:
+        if x == "":
+            sign = ""
+        else:
+            sign = " + "
+    y = display_float(y, digits, method = method, extra_truncation_digits = extra_truncation_digits)
+    if y == "1":
+        y = "";
+    res = x + sign + y + r"i"
+    if parenthesis and x != "":
+        res = "(" + res + ")"
+    return res
+
+def round_to_half_int(num, fraction=2):
+    """
+    Rounds input `num` to the nearest half-integer. The optional kwarg
+    `fraction` is used to round to the nearest `fraction`-part of an integer.
 
     Examples:
-    >>> truncate_number(1.0001, 4)
-    '1'
-    >>> truncate_number(1.1234567, 4)
-    '1.12'
+    >>> round_to_half_int(1.1)
+    1
+    >>> round_to_half_int(-0.9)
+    -1
+    >>> round_to_half_int(0.5)
+    1/2
     """
-    local_precision = precision
-    if num < 0:
-        local_precision = local_precision + 1
-    truncation = float(10 ** (-1.0 * local_precision))
-    test = round_to_half_int(num)
-    if float(abs(num - test)) < truncation:
-        if int(test) == test:
-            return str(int(test))
-        return str(test)
-    return(str(num)[0:int(local_precision)])
+    return round(num * 1.0 * fraction) / fraction
+
+
 
 
 def splitcoeff(coeff):
@@ -219,6 +451,12 @@ def comma(x):
     return x < 1000 and str(x) or ('%s,%03d' % (comma(x // 1000), (x % 1000)))
 
 
+def format_percentage(num, denom):
+    if denom == 0:
+        return 'NaN'
+    return "%10.2f"%((100.0*num)/denom)
+
+
 def signtocolour(sign):
     """
     Assigns an rgb string colour to a complex number based on its argument.
@@ -241,43 +479,6 @@ def rgbtohex(rgb):
     b = int(b)
     return "#{:02x}{:02x}{:02x}".format(r,g,b)
 
-
-def encode_plot(P):
-    """
-    Convert a plot object to base64-encoded png format.
-
-    The resulting object is a base64-encoded version of the png
-    formatted plot, which can be displayed in web pages with no
-    further intervention.
-    """
-    from StringIO import StringIO
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from base64 import b64encode
-    from urllib import quote
-
-    virtual_file = StringIO()
-    fig = P.matplotlib()
-    fig.set_canvas(FigureCanvasAgg(fig))
-    fig.savefig(virtual_file, format='png')
-    virtual_file.seek(0)
-    return "data:image/png;base64," + quote(b64encode(virtual_file.buf))
-
-
-def image_src(G):
-    return ajax_url(image_callback, G, _ajax_sticky=True)
-
-
-def image_callback(G):
-    P = G.plot()
-    _, filename = tempfile.mkstemp('.png')
-    P.save(filename)
-    data = open(filename).read()
-    os.unlink(filename)
-    response = make_response(data)
-    response.headers['Content-type'] = 'image/png'
-    return response
-
-
 def pol_to_html(p):
     r"""
     Convert polynomial p with variable x to html.
@@ -299,9 +500,11 @@ def pol_to_html(p):
 #  latex/mathjax utilities
 ################################################################################
 
-def web_latex(x):
+def web_latex(x, enclose=True):
     """
-    Convert input to latex string unless it's a string or unicode.
+    Convert input to latex string unless it's a string or unicode. The key word
+    argument `enclose` indicates whether to surround the string with
+    `\(` and `\)` to make it a mathjax equation.
 
     Note:
     if input is a factored ideal, use web_latex_ideal_fact instead.
@@ -313,13 +516,16 @@ def web_latex(x):
     """
     if isinstance(x, (str, unicode)):
         return x
-    else:
+    if enclose == True:
         return "\( %s \)" % latex(x)
+    return " %s " % latex(x)
 
 
-def web_latex_ideal_fact(x):
+def web_latex_ideal_fact(x, enclose=True):
     """
-    Convert input factored ideal to latex string.
+    Convert input factored ideal to latex string.  The key word argument
+    `enclose` indicates whether to surround the string with `\(` and
+    `\)` to make it a mathjax equation.
 
     sage puts many parentheses around latex representations of factored ideals.
     This function removes excessive parentheses.
@@ -334,7 +540,7 @@ def web_latex_ideal_fact(x):
     >>> web_latex_ideal_fact(I)
     '\\( \\left(-a\\right)^{-1} \\)'
     """
-    y = web_latex(x)
+    y = web_latex(x, enclose=enclose)
     y = y.replace("(\\left(","\\left(")
     y = y.replace("\\right))","\\right)")
     return y
@@ -439,6 +645,99 @@ def web_latex_split_on_re(x, r = '(q[^+-]*[+-])'):
     A = A.replace('+\) \(O','+O')
     return A
 
+def display_knowl(kid, title=None, kwargs={}):
+    """
+    Allows for the construction of knowls from python code
+    (to be displayed using the ``safe`` flag in jinja);
+    the only difference with the KNOWL macro is that
+    there will be no edit link for authenticated users.
+    """
+    from lmfdb.knowledge.knowl import knowl_title
+    ktitle = knowl_title(kid)
+    if ktitle is None:
+        # Knowl not found
+        if title is None:
+            return """<span class="knowl knowl-error">'%s'</span>""" % kid
+        else:
+            return title
+    else:
+        if title is None:
+            if len(ktitle) == 0:
+                title = kid
+            else:
+                title = ktitle
+        if len(title) > 0:
+            return '<a title="{0} [{1}]" knowl="{1}" kwargs="{2}">{3}</a>'.format(ktitle, kid, urlencode(kwargs), title)
+        else:
+            return ''
+
+def bigint_knowl(n, cutoff=8, sides=2):
+    if abs(n) >= 10**cutoff:
+        short = str(n)
+        short = short[:sides] + r'\!\cdots\!' + short[-sides:]
+        return r'<a title="[bigint]" knowl="dynamic_show" kwargs="%s">\(%s\)</a>'%(n, short)
+    else:
+        return r'\(%s\)'%n
+
+def polyquo_knowl(f):
+    short = r'\mathbb{Q}[x]/(x^{%s} + \cdots)'%(len(f) - 1)
+    long = r'Defining polynomial: %s' % (web_latex_split_on_pm(coeff_to_poly(f)))
+    return r'<a title="[poly]" knowl="dynamic_show" kwargs="%s">\(%s\)</a>'%(long, short)
+
+def web_latex_poly(coeffs, var='x', superscript=True, cutoff=8):
+    """
+    Generate a web latex string for a given integral polynomial, or a linear combination
+    (using subscripts instead of exponents).  In either case, the constant term is printed
+    without a variable and bigint knowls are used if the coefficients are large enough.
+
+    INPUT:
+
+    - ``coeffs`` -- a list of integers
+    - ``var`` -- a variable name
+    - ``superscript`` -- whether to use superscripts (as opposed to subscripts)
+    - ``cutoff`` -- the string length above which a knowl is used for a coefficient
+    """
+    plus = r"\mathstrut +\mathstrut \) "
+    minus = r"\mathstrut -\mathstrut \) "
+    m = len(coeffs)
+    while m and coeffs[m-1] == 0:
+        m -= 1
+    if m == 0:
+        return r"\(0\)"
+    s = ""
+    for n in reversed(xrange(m)):
+        c = coeffs[n]
+        if n == 1:
+            if superscript:
+                varpow = r"\(" + var
+            else:
+                varpow = r"\(%s_{1}"%var
+        elif n > 1:
+            if superscript:
+                varpow = r"\(%s^{%s}"%(var, n)
+            else:
+                varpow = r"\(%s_{%s}"%(var, n)
+        else:
+            if c > 0:
+                s += plus + bigint_knowl(c, cutoff)
+            elif c < 0:
+                s += minus + bigint_knowl(-c, cutoff)
+            break
+        if c > 0:
+            s += plus
+        elif c < 0:
+            s += minus
+        else:
+            continue
+        if abs(c) != 1:
+            s += bigint_knowl(abs(c), cutoff) + " "
+        s += varpow
+    if coeffs[0] == 0:
+        s += r"\)"
+    if s.startswith(plus):
+        return s[len(plus):]
+    else:
+        return r"\(-\)" + s[len(minus):]
 
 # make latex matrix from list of lists
 def list_to_latex_matrix(li):
@@ -460,109 +759,50 @@ def list_to_latex_matrix(li):
     mm += r'\end{array}\right)'
     return mm
 
-
-
 ################################################################################
-#  SON utilities
+#  pagination utilities
 ################################################################################
 
-def len_val_fn(value):
-    """ This creates a SON pair of the type {len:len(value), val:value}, with the len first so lexicographic ordering works.
-        WATCH OUT however as later manipulations of the database are likely to mess up this ordering if not careful.
-        For this, use order_values below.
-        Later we should implement SON_manipulators that insert and save safely.
-
-        Detailed explanation: This is kind of a hack for mongodb:
-        Mongo uses lexicographic(?) ordering on strings, which is not convenient when
-        strings are used to represent integers (necessary because of large integers).
-        For instance, it would not compare properly a generic 2 character/digit
-        integer and a 10 character/digit one. This means we lose the ability to
-        perform some range queries easily with mongo syntax.
-        The solution we are using is to set up a SON ordered dict for this:
-        If we had one of the field in our document called "Conductor":"342353223525",
-        we replace that with "Conductor_plus":{"len": int(12), "value": "342353223525"}
-        (12 is the length of that string)
-        This SON object is ordered, so the "len" entry comes first.
-        When comparing ordered dicts (=SON), mongo uses a recursive algorithm.
-        At the ordered dict stage it uses lexicographic ordering on the keys.
-        Inside each key,value pair it compares based on the default ordering of the value type.
-        For "Conductor_plus", it will first compare on the length, and if those are equal
-        compare on the strings.
+class ValueSaver(object):
     """
-    import bson
-    return bson.SON([("len", len(value)), ("val", value)])
-
-
-def order_values(doc, field, sub_fields=["len", "val"]):
-    """ Retrieving a document then saving it messes up the ordering in SON documents. This allows you to take a document,
-        retrieve a specific field, order it according to the order of sub_fields, and return a document with a SON in place,
-        which can then be saved.
+    Takes a generator and saves values as they are generated so that values can be retrieved multiple times.
     """
-    import bson
-    tmp = doc[field]
-    doc[field] = bson.SON([(sub_field, tmp[sub_field]) for sub_field in sub_fields])
-    return doc
+    def __init__(self, source):
+        self.source = source
+        self.store = []
+    def fill(self, stop):
+        """
+        Consumes values from the source until there are at least ``stop`` entries in the store.
+        """
+        if stop > len(self.store):
+            self.store.extend(islice(self.source, stop - len(self.store)))
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            if (i.start is not None and i.start < 0) or i.stop is None or i.stop < 0 or (i.step is not None and i.step < 0):
+                raise ValueError("Only positive indexes supported")
+            self.fill(i.stop)
+            return self.store[i]
+        else:
+            self.fill(i+1)
+            return self.store[i]
+    def __len__(self):
+        raise TypeError("Unknown length")
 
+class Pagination(object):
+    """
+    INPUT:
 
-
-################################################################################
-#  pymongo utilities
-################################################################################
-
-def random_object_from_collection(collection):
-    """ retrieves a random object from mongo db collection; uses collection.rand to improve performance if present """
-    import pymongo
-    n = collection.rand.count()
-    if n:
-        m = collection.count()
-        if m != n:
-            current_app.logger.warning("Random object index {0}.rand is out of date ({1} != {2}), proceeding anyway.".format(collection,n,m))
-        obj = collection.find_one({'_id':collection.rand.find_one({'num':randint(1,n)})['_id']})
-        if obj: # we could get null here if objects have been deleted without recreating the collection.rand index, if this happens, just rever to old method
-            return obj
-    if pymongo.version_tuple[0] < 3:
-        return collection.aggregate({ '$sample': { 'size': int(1) } }, cursor = {} ).next()
-    else:
-        # Changed in version 3.0: The aggregate() method always returns a CommandCursor. The pipeline argument must be a list.
-        return collection.aggregate([{ '$sample': { 'size': int(1) } } ]).next()
-
-
-def random_value_from_collection(collection,attribute):
-    """ retrieves the value of attribute (e.g. label) from a random object in mongo db collection; uses collection.rand to improve performance if present """
-    import pymongo
-    n = collection.rand.count()
-    if n:
-        m = collection.count()
-        if m != n:
-            current_app.logger.warning("Random object index {0}.rand is out of date ({1} < {2})".format(collection,n,m))
-        obj = collection.find_one({'_id':collection.rand.find_one({'num':randint(1,n)})['_id']},{'_id':False,attribute:True})
-        if obj: # we could get null here if objects have been deleted without recreating the collection.rand index, if this happens, just rever to old method
-            return obj.get(attribute)
-    if pymongo.version_tuple[0] < 3:
-        return collection.aggregate({ '$sample': { 'size': int(1) } }, cursor = {} ).next().get(attribute) # don't bother optimizing this
-    else:
-        # Changed in version 3.0: The aggregate() method always returns a CommandCursor. The pipeline argument must be a list.
-        return collection.aggregate([{ '$sample': { 'size': int(1) } }, { '$project' : {'_id':False,attribute:True}} ]).next().get(attribute)
-
-
-def attribute_value_counts(collection,attribute):
-    """ returns a sorted array of pairs (value,count) with count=collection.find({attribute:value}); uses collection.stats to improve peroformance if present """
-    if collection.stats.count():
-        m = collection.count()
-        stats = collection.stats.find_one({'_id':attribute},{'total':True,'counts':True})
-        if stats and 'counts' in stats:
-            # Don't use statistics that we know are out of date.
-            if stats['total'] != m:
-                current_app.logger.warning("Statistics in {0}.stats are out of date ({1} != {2}), they will not be used until they are updated.".format(collection,stats['total'],m))
-            else:
-                return stats['counts']
-    # note that pymongo will raise an error if the return value from .distinct is large than 16MB (this is a good thing)
-    return [[value,collection.find({attribute:value}).count()] for value in sorted(collection.distinct(attribute))]
-
-
-class MongoDBPagination(object):
-    def __init__(self, query, per_page, page, endpoint, endpoint_params):
-        self.query = query
+    - ``source`` -- a list or generator containing results.
+        If a generator, won't support the ``count`` or ``pages`` attributes
+    - ``per_page`` -- an integer, the number of results shown per page
+    - ``page`` -- the current page (initial value is 1)
+    - ``endpoint`` -- an argument for ``url_for`` to get more pages
+    - ``endpoint_params`` -- keyword arguments for the ``url_for`` call
+    """
+    def __init__(self, source, per_page, page, endpoint, endpoint_params):
+        if isinstance(source, GeneratorType):
+            source = ValueSaver(source)
+        self.source = source
         self.per_page = int(per_page)
         self.page = int(page)
         self.endpoint = endpoint
@@ -570,17 +810,33 @@ class MongoDBPagination(object):
 
     @cached_property
     def count(self):
-        return self.query.count(True)
+        return len(self.source)
 
     @cached_property
     def entries(self):
-        return self.query.skip(self.start).limit(self.per_page)
+        return self.source[self.start : self.start+self.per_page]
+
+    @cached_property
+    def has_next(self):
+        try:
+            self.source[self.start + self.per_page]
+        except IndexError:
+            return False
+        else:
+            return True
 
     has_previous = property(lambda x: x.page > 1)
-    has_next = property(lambda x: x.page < x.pages)
     pages = property(lambda x: max(0, x.count - 1) // x.per_page + 1)
     start = property(lambda x: (x.page - 1) * x.per_page)
     end = property(lambda x: min(x.start + x.per_page - 1, x.count - 1))
+
+    @property
+    def end(self):
+        if isinstance(self.source, ValueSaver):
+            self.source.fill(self.start + self.per_page)
+            return len(self.source.store) - 1
+        else:
+            return min(self.start + self.per_page, self.count) - 1
 
     @property
     def previous(self):
@@ -593,21 +849,6 @@ class MongoDBPagination(object):
         kwds = copy(self.endpoint_params)
         kwds['page'] = self.page + 1
         return url_for(self.endpoint, **kwds)
-
-
-class LazyMongoDBPagination(MongoDBPagination):
-    @cached_property
-    def has_next(self):
-        return self.query.skip(self.start).limit(self.per_page + 1).count(True) > self.per_page
-
-    @property
-    def count(self):
-        raise NotImplementedError
-
-    @property
-    def pages(self):
-        raise NotImplementedError
-
 
 ################################################################################
 #  web development utilities
@@ -693,7 +934,7 @@ class LmfdbFormatter(logging.Formatter):
         return logging.Formatter.format(self, record)
 
 
-def make_logger(bp_or_name, hl=False):
+def make_logger(bp_or_name, hl = False, extraHandlers = [] ):
     """
     creates a logger for the given blueprint. if hl is set
     to true, the corresponding lines will be bold.
@@ -721,10 +962,13 @@ def make_logger(bp_or_name, hl=False):
         l.setLevel(logging.DEBUG)
     else:
         l.setLevel(logging.WARNING)
-    formatter = LmfdbFormatter(hl=name if hl else None)
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    l.addHandler(ch)
+    if len(l.handlers) == 0:
+        formatter = LmfdbFormatter(hl=name if hl else None)
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        l.addHandler(ch)
+        for elt in extraHandlers:
+            l.addHandler(elt)
     return l
 
 
@@ -844,7 +1088,6 @@ def ajax_more(callback, *arg_list, **kwds):
 def image_src(G):
     return ajax_url(image_callback, G, _ajax_sticky=True)
 
-
 def image_callback(G):
     P = G.plot()
     _, filename = tempfile.mkstemp('.png')
@@ -855,90 +1098,7 @@ def image_callback(G):
     response.headers['Content-type'] = 'image/png'
     return response
 
-def len_val_fn(value):
-    """ This creates a SON pair of the type {len:len(value), val:value}, with the len first so lexicographic ordering works.
-        WATCH OUT however as later manipulations of the database are likely to mess up this ordering if not careful.
-        For this, use order_values below.
-        Later we should implement SON_manipulators that insert and save safely.
-
-        Detailed explanation: This is kind of a hack for mongodb:
-        Mongo uses lexicographic(?) ordering on strings, which is not convenient when 
-        strings are used to represent integers (necessary because of large integers).
-        For instance, it would not compare properly a generic 2 character/digit
-        integer and a 10 character/digit one. This means we lose the ability to
-        perform some range queries easily with mongo syntax.
-        The solution we are using is to set up a SON ordered dict for this:
-        If we had one of the field in our document called "Conductor":"342353223525",
-        we replace that with "Conductor_plus":{"len": int(12), "value": "342353223525"}
-        (12 is the length of that string)
-        This SON object is ordered, so the "len" entry comes first.
-        When comparing ordered dicts (=SON), mongo uses a recursive algorithm.
-        At the ordered dict stage it uses lexicographic ordering on the keys.
-        Inside each key,value pair it compares based on the default ordering of the value type.
-        For "Conductor_plus", it will first compare on the length, and if those are equal
-        compare on the strings. 
-    """
-    import bson
-    return bson.SON([("len", len(value)), ("val", value)])
-
-
-def order_values(doc, field, sub_fields=["len", "val"]):
-    """ Retrieving a document then saving it messes up the ordering in SON documents. This allows you to take a document,
-        retrieve a specific field, order it according to the order of sub_fields, and return a document with a SON in place,
-        which can then be saved.
-    """
-    import bson
-    tmp = doc[field]
-    doc[field] = bson.SON([(sub_field, tmp[sub_field]) for sub_field in sub_fields])
-    return doc
-
-def comma(x):
-    """
-    Input is an integer. Output is a string of that integer with commas.
-    CAUTION: this misbehaves if the input is not an integer.
-
-    Example:
-    >>> comma("12345")
-    '12,345'
-    """
-    return x < 1000 and str(x) or ('%s,%03d' % (comma(x // 1000), (x % 1000)))
-
-def coeff_to_poly(c):
-    """
-    Convert a string representation of a polynomial to a sage polynomial.
-
-    Examples:
-    >>> coeff_to_poly("1 - 3x + x^2")
-    x**2 - 3*x + 1
-    >>> coeff_to_poly("1 - 3*x + x**2")
-    x**2 - 3*x + 1
-    """
-    from sage.all import PolynomialRing, QQ
-    return PolynomialRing(QQ, 'x')(c)
-
-def display_multiset(mset, formatter=str, *args):
-    """
-    Input mset is a list of pairs [item, multiplicity]
-    Return a string for display of the multi-set.  The
-    function formatter is a function whose first argument
-    is the item, and *args are the other arguments
-    and is applied to each item.
-
-    Example:
-    >>> display_multiset([["a", 5], [1, 3], ["cat", 2]])
-    'a x5, 1 x3, cat x2'
-    """
-    return ', '.join([formatter(pair[0], *args)+(' x%d'% pair[1] if pair[1]>1 else '') for pair in mset])
-
-def debug():
-    """
-    this triggers the debug environment on purpose. you have to start
-    the server via website.py --debug
-    don't forget to remove the debug() from your code!!!
-    """
-    assert current_app.debug is False, "Don't panic! You're here by request of debug()"
-
-def encode_plot(P, pad=None, pad_inches=0.1, bbox_inches=None):
+def encode_plot(P, pad=None, pad_inches=0.1, bbox_inches=None, remove_axes = False):
     """
     Convert a plot object to base64-encoded png format.
 
@@ -956,56 +1116,11 @@ def encode_plot(P, pad=None, pad_inches=0.1, bbox_inches=None):
     virtual_file = StringIO()
     fig = P.matplotlib()
     fig.set_canvas(FigureCanvasAgg(fig))
+    if remove_axes:
+        for a in fig.axes:
+            a.axis('off')
     if pad is not None:
         fig.tight_layout(pad=pad)
     fig.savefig(virtual_file, format='png', pad_inches=pad_inches, bbox_inches=bbox_inches)
     virtual_file.seek(0)
     return "data:image/png;base64," + quote(b64encode(virtual_file.buf))
-
-
-def signtocolour(sign):
-    """
-    Assigns an rgb string colour to a complex number based on its argument.
-    """
-    argument = cmath.phase(CC(str(sign)))
-    r = int(255.0 * (math.cos((1.0 * math.pi / 3.0) - (argument / 2.0))) ** 2)
-    g = int(255.0 * (math.cos((2.0 * math.pi / 3.0) - (argument / 2.0))) ** 2)
-    b = int(255.0 * (math.cos(argument / 2.0)) ** 2)
-    return("rgb(" + str(r) + "," + str(g) + "," + str(b) + ")")
-
-def rgbtohex(rgb):
-    """
-    Convergs an rgb string color representation into a hex string color
-    representation. For example, this converts rgb(63,255,100) to #3fff64
-    """
-    r,g,b = rgb[4:-1].split(',')
-    r = int(r)
-    g = int(g)
-    b = int(b)
-    return "#{:02x}{:02x}{:02x}".format(r,g,b)
-
-
-def truncatenumber(numb, precision):
-    localprecision = precision
-    if numb < 0:
-        localprecision = localprecision + 1
-    truncation = float(10 ** (-1.0*localprecision))
-    if float(abs(numb - 1)) < truncation:
-        return("1")
-    elif float(abs(numb - 2)) < truncation:
-        return("2")
-    elif float(abs(numb - 3)) < truncation:
-        return("3")
-    elif float(abs(numb - 4)) < truncation:
-        return("4")
-    elif float(abs(numb)) < truncation:
-        return("0")
-    elif float(abs(numb + 1)) < truncation:
-        return("-1")
-    elif float(abs(numb + 2)) < truncation:
-        return("-2")
-    elif float(abs(numb - 0.5)) < truncation:
-        return("0.5")
-    elif float(abs(numb + 0.5)) < truncation:
-        return("-0.5")
-    return(str(numb)[0:int(localprecision)])
